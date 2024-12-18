@@ -1,0 +1,244 @@
+#include <Arduino.h>
+
+// Pin definitions
+const int MOTOR_ENABLE_PIN = 6;  // Motor enable pin (PWM)
+const int MOTOR_IN1_PIN = 5;     // Motor direction pin 1
+const int MOTOR_IN2_PIN = 4;     // Motor direction pin 2
+const int RAIN_SENSOR_PIN = 14;  // Rain sensor analog pin (A0 = 14 on most Arduino boards)
+const int LIGHT_SENSOR_PIN = 15; // Light sensor (LDR) analog pin (A1 = 15 on most Arduino boards)
+const int NODE_COMMAND_PIN = 7;  // Arduino pin connected to NodeMCU D1
+
+// Motor control states
+bool motorRunning = false;
+bool hasRunLDRLight = false;
+bool hasRunRainWater = false;
+bool hasRunLDRDark = false;
+bool hasRunRainNoWater = false;
+
+// Command detection variables
+int lastNodeCommand = LOW;
+unsigned long lastCommandTime = 0;
+int pulseCount = 0;
+unsigned long motorStartTime = 0;
+bool waitingForPulses = false;           // New flag to track if we're waiting for pulses
+const unsigned long PULSE_TIMEOUT = 500; // 500ms timeout for pulses
+const unsigned long COMMAND_DELAY = 750; // Delay after pulse
+
+// Configuration constants
+const int RAIN_THRESHOLD = 500;                   // Adjust based on rain sensor readings (0-1023)
+const int LIGHT_THRESHOLD = 200;                  // Adjust based on LDR readings (0-1023)
+const unsigned long ROTATION_TIME = 7000;         // 7 seconds for full rotation
+const int MOTOR_SPEED = 255;                      // Motor speed (0-255)
+const unsigned long STATUS_PRINT_INTERVAL = 1000; // Status print interval in ms
+
+// Function declarations
+void startMotor(bool direction);
+void stopMotor();
+void printStatus(int nodeCommand, int rainValue, int lightValue);
+
+void setup()
+{
+    // Initialize serial communication
+    Serial.begin(115200);
+    Serial.println(F("Starting Arduino..."));
+
+    // Configure motor control pins
+    pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+    pinMode(MOTOR_IN1_PIN, OUTPUT);
+    pinMode(MOTOR_IN2_PIN, OUTPUT);
+
+    // Configure sensor pins
+    pinMode(RAIN_SENSOR_PIN, INPUT);
+    pinMode(LIGHT_SENSOR_PIN, INPUT);
+    pinMode(NODE_COMMAND_PIN, INPUT);
+
+    // Ensure motor is off at startup
+    stopMotor();
+
+    Serial.println(F("Setup complete"));
+}
+
+void startMotor(bool direction)
+{
+    motorRunning = true;
+    analogWrite(MOTOR_ENABLE_PIN, MOTOR_SPEED);
+
+    if (direction)
+    {
+        digitalWrite(MOTOR_IN1_PIN, HIGH); // Clockwise (OUT)
+        digitalWrite(MOTOR_IN2_PIN, LOW);
+        Serial.println(F("Motor starting - Moving OUT"));
+    }
+    else
+    {
+        digitalWrite(MOTOR_IN1_PIN, LOW); // Counterclockwise (IN)
+        digitalWrite(MOTOR_IN2_PIN, HIGH);
+        Serial.println(F("Motor starting - Moving IN"));
+    }
+    motorStartTime = millis();
+}
+
+void stopMotor()
+{
+    motorRunning = false;
+    digitalWrite(MOTOR_IN1_PIN, LOW);
+    digitalWrite(MOTOR_IN2_PIN, LOW);
+    analogWrite(MOTOR_ENABLE_PIN, 0);
+    pulseCount = 0;
+    Serial.println(F("Motor stopped"));
+}
+
+void printStatus(int nodeCommand, int rainValue, int lightValue)
+{
+    // Print current status to Serial Monitor
+    Serial.println(F("\n--- Status ---"));
+    Serial.print(F("NodeMCU Command: "));
+    Serial.println(nodeCommand);
+    Serial.print(F("Motor Running: "));
+    Serial.println(motorRunning);
+    Serial.print(F("Rain Value: "));
+    Serial.println(rainValue);
+    Serial.print(F("Light Value: "));
+    Serial.println(lightValue);
+}
+
+void loop()
+{
+    static unsigned long lastPrint = 0;
+
+    // Read sensor values
+    const int nodeCommand = digitalRead(NODE_COMMAND_PIN);
+    const int rainSensorVal = analogRead(RAIN_SENSOR_PIN);
+    const int ldrVal = analogRead(LIGHT_SENSOR_PIN);
+
+    // Handle manual control from NodeMCU
+    if (nodeCommand != lastNodeCommand)
+    {
+        if (nodeCommand == HIGH)
+        {
+            if (millis() - lastCommandTime < PULSE_TIMEOUT)
+            {
+                pulseCount++;
+                Serial.print(F("Pulse count: "));
+                Serial.println(pulseCount);
+            }
+            else
+            {
+                pulseCount = 1;
+            }
+            lastCommandTime = millis();
+            waitingForPulses = true; // Start waiting for potential additional pulses
+        }
+        lastNodeCommand = nodeCommand;
+    }
+
+    // Process command after waiting period
+    if (waitingForPulses && !motorRunning &&
+        (millis() - lastCommandTime >= COMMAND_DELAY))
+    {
+
+        waitingForPulses = false; // Reset waiting flag
+
+        // Process accumulated pulses
+        if (pulseCount == 1)
+        {
+            Serial.println(F("Manual IN command received"));
+            startMotor(true); // Move inside
+        }
+        else if (pulseCount == 2)
+        {
+            Serial.println(F("Manual OUT command received"));
+            startMotor(false); // Move outside
+        }
+
+        pulseCount = 0; // Reset pulse count after processing
+    }
+
+    // Reset pulse count and waiting flag after timeout
+    if (!waitingForPulses && millis() - lastCommandTime > PULSE_TIMEOUT)
+    {
+        pulseCount = 0;
+    }
+
+    // Check if motor needs to stop
+    if (motorRunning && (millis() - motorStartTime >= ROTATION_TIME))
+    {
+        stopMotor();
+    }
+
+    // Automated control (only if motor is not running and no manual control)
+    if (!motorRunning && pulseCount == 0)
+    {
+        const bool isDay = ldrVal > LIGHT_THRESHOLD;
+        const bool isRaining = rainSensorVal < RAIN_THRESHOLD;
+
+        // Daytime conditions
+        if (isDay)
+        {
+            if (!hasRunLDRLight || hasRunLDRDark)
+            {
+                if (!isRaining)
+                {
+                    startMotor(false); // Move inside
+                    hasRunLDRLight = true;
+                    hasRunLDRDark = false;
+                }
+                else
+                {
+                    Serial.println(F("Rain detected, motor will not run."));
+                }
+            }
+
+            // Rain handling during day (move inside if raining)
+            if (isRaining && !hasRunRainWater)
+            {
+                startMotor(false); // Move inside
+                hasRunRainWater = true;
+            }
+            else if (!isRaining && !hasRunRainNoWater)
+            {
+                startMotor(true);         // Move outside
+                hasRunRainNoWater = true; // Allow to move outside after rain stops
+            }
+        }
+
+        // Night time conditions
+        else if (!isDay && !hasRunLDRDark) {
+            // Prevent the motor from moving outside at night
+            // Just move inside if it's not already inside
+            if (!motorRunning) {
+                startMotor(false);   // Move inside
+            }
+            hasRunLDRDark = true;
+            hasRunLDRLight = false;
+        }
+
+        // Reset conditions based on current state
+        if (!isDay)
+        {
+            hasRunLDRLight = false;
+        }
+        if (isDay)
+        {
+            hasRunLDRDark = false;
+        }
+        if (!isRaining)
+        {
+            hasRunRainWater = false;
+        }
+        if (isRaining)
+        {
+            hasRunRainNoWater = false;
+        }
+    }
+
+    // Print status at regular intervals
+    if (millis() - lastPrint >= STATUS_PRINT_INTERVAL)
+    {
+        lastPrint = millis();
+        printStatus(nodeCommand, rainSensorVal, ldrVal);
+    }
+
+    // Small delay for stability
+    delay(10);
+}
